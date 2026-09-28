@@ -52,59 +52,88 @@ export default function App() {
       const params = new URLSearchParams(window.location.search);
       const queryRoom = params.get('room') || params.get('join') || params.get('code');
       const queryModule = params.get('module') || params.get('mod');
+
       if (queryRoom) {
-        const matched = getRoomById(queryRoom);
-        if (matched) {
-          if (queryModule) {
-            matched.config.selectedModuleId = queryModule;
-          }
-          setRoom(matched);
-        } else {
-          fetch(`/api/rooms/${queryRoom}`)
-            .then((res) => (res.ok ? res.json() : null))
-            .then((data) => {
-              if (data && data.config) {
-                if (queryModule) {
-                  data.config.selectedModuleId = queryModule;
-                }
-                setRoom(data);
-                saveRoom(data);
+        // Student joining room from QR code: Fetch directly from server first
+        fetch(`/api/rooms/${queryRoom}`)
+          .then((res) => (res.ok ? res.json() : null))
+          .then((data) => {
+            if (data && data.config) {
+              if (queryModule) {
+                data.config.selectedModuleId = queryModule;
               }
-            })
-            .catch(() => {});
-        }
+              setRoom(data);
+              saveRoom(data);
+            } else {
+              const matched = getRoomById(queryRoom);
+              if (matched) {
+                if (queryModule) matched.config.selectedModuleId = queryModule;
+                setRoom(matched);
+              }
+            }
+          })
+          .catch(() => {
+            const matched = getRoomById(queryRoom);
+            if (matched) {
+              if (queryModule) matched.config.selectedModuleId = queryModule;
+              setRoom(matched);
+            }
+          });
         setCurrentView('student');
+      } else {
+        // Teacher mode: Fetch active room from server to ensure perfect sync
+        fetch('/api/rooms/active')
+          .then((res) => (res.ok ? res.json() : null))
+          .then((data) => {
+            if (data && data.config) {
+              setRoom(data);
+              saveRoom(data);
+            }
+          })
+          .catch(() => {});
       }
     } catch {
       // Ignore URL parsing errors
     }
   }, []);
 
-  // Multi-tab synchronization & background server polling
+  // Real-time synchronization (SSE & Polling fallback)
   useEffect(() => {
     const unsubscribe = subscribeToSync((event) => {
       if (
         event.type === 'new_submission' ||
         event.type === 'rooms_updated' ||
-        event.type === 'student_registered'
+        event.type === 'student_registered' ||
+        event.type === 'room_updated'
       ) {
-        const fresh = getRoomById(room.config.id);
-        if (fresh) setRoom(fresh);
+        fetch(`/api/rooms/${room.config.id}`)
+          .then((res) => (res.ok ? res.json() : null))
+          .then((fresh) => {
+            if (fresh && fresh.config) {
+              setRoom(fresh);
+            }
+          })
+          .catch(() => {
+            const fresh = getRoomById(room.config.id);
+            if (fresh) setRoom(fresh);
+          });
       }
-    });
+    }, room.config.id);
 
     const pollInterval = setInterval(() => {
       fetch(`/api/rooms/${room.config.id}`)
         .then((res) => (res.ok ? res.json() : null))
         .then((remoteData) => {
-          if (remoteData) {
+          if (remoteData && remoteData.config) {
             setRoom((prev) => {
               const subChanged =
                 (remoteData.submissions?.length || 0) !== (prev.submissions?.length || 0);
               const regChanged =
                 (remoteData.registeredStudents?.length || 0) !==
                 (prev.registeredStudents?.length || 0);
-              if (subChanged || regChanged) {
+              const modChanged =
+                remoteData.config.selectedModuleId !== prev.config.selectedModuleId;
+              if (subChanged || regChanged || modChanged) {
                 return remoteData;
               }
               return prev;
@@ -112,7 +141,7 @@ export default function App() {
           }
         })
         .catch(() => {});
-    }, 3000);
+    }, 1500);
 
     return () => {
       unsubscribe();

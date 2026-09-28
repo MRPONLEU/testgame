@@ -4,7 +4,10 @@ import { DEFAULT_EXAM_PRESETS, DEFAULT_MODULES } from '../data/defaultQuestions'
 const ROOMS_KEY = 'khmerquiz_rooms';
 const ACTIVE_ROOM_KEY = 'khmerquiz_active_room_id';
 
-// BroadcastChannel for instant multi-tab sync
+export const DEFAULT_ROOM_ID = 'room_main';
+export const DEFAULT_ROOM_CODE = '430-657';
+
+// BroadcastChannel for instant multi-tab sync on same device
 let channel: BroadcastChannel | null = null;
 try {
   if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
@@ -14,14 +17,50 @@ try {
   channel = null;
 }
 
-export function subscribeToSync(callback: (event: { type: string; payload?: unknown }) => void): () => void {
-  if (!channel) return () => {};
-  const handler = (e: MessageEvent) => {
+// Server-Sent Events source for real-time cross-device sync (PC <-> Mobile)
+let sseSource: EventSource | null = null;
+
+export function subscribeToSync(
+  callback: (event: { type: string; payload?: unknown }) => void,
+  roomId: string = DEFAULT_ROOM_ID
+): () => void {
+  // 1. Same-device BroadcastChannel
+  const channelHandler = (e: MessageEvent) => {
     if (e.data) callback(e.data);
   };
-  channel.addEventListener('message', handler);
+  channel?.addEventListener('message', channelHandler);
+
+  // 2. Cross-device Real-Time Server-Sent Events (SSE)
+  if (typeof window !== 'undefined' && 'EventSource' in window) {
+    try {
+      if (sseSource) {
+        sseSource.close();
+      }
+      sseSource = new EventSource(`/api/rooms/${roomId}/events`);
+      sseSource.onmessage = (event) => {
+        try {
+          const parsed = JSON.parse(event.data);
+          if (parsed && parsed.type) {
+            callback({ type: parsed.type, payload: parsed.payload });
+          }
+        } catch {
+          // Heartbeat or comment
+        }
+      };
+      sseSource.onerror = () => {
+        // SSE reconnects automatically
+      };
+    } catch {
+      // Ignore SSE failure
+    }
+  }
+
   return () => {
-    channel?.removeEventListener('message', handler);
+    channel?.removeEventListener('message', channelHandler);
+    if (sseSource) {
+      sseSource.close();
+      sseSource = null;
+    }
   };
 }
 
@@ -34,8 +73,7 @@ export function broadcastEvent(type: string, payload?: unknown) {
 }
 
 export function generateRoomCode(): string {
-  const num = Math.floor(100000 + Math.random() * 900000);
-  return `${String(num).slice(0, 3)}-${String(num).slice(3)}`;
+  return DEFAULT_ROOM_CODE;
 }
 
 export function getAllRooms(): Record<string, RoomData> {
@@ -60,10 +98,14 @@ export function saveAllRooms(rooms: Record<string, RoomData>) {
 export function getRoomById(roomId: string): RoomData | null {
   const rooms = getAllRooms();
   if (rooms[roomId]) return rooms[roomId];
-  // Also try looking up by code
+  // Also try looking up by code or clean code
   const cleanCode = roomId.replace(/\D/g, '');
   for (const r of Object.values(rooms)) {
-    if (r.config.code.replace(/\D/g, '') === cleanCode || r.config.id === roomId) {
+    if (
+      r.config.id === roomId ||
+      r.config.code === roomId ||
+      (cleanCode && r.config.code.replace(/\D/g, '') === cleanCode)
+    ) {
       return r;
     }
   }
@@ -74,18 +116,19 @@ export function saveRoom(room: RoomData) {
   const rooms = getAllRooms();
   rooms[room.config.id] = room;
   saveAllRooms(rooms);
-  // Also post to backend if accessible
+
+  // Synchronize to backend server so all remote clients (students on mobile) have access
   fetch(`/api/rooms/${room.config.id}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(room),
   }).catch(() => {
-    // Backend offline / standalone fallback is fine
+    // Offline fallback is fine
   });
 }
 
-export function getActiveRoomId(): string | null {
-  return localStorage.getItem(ACTIVE_ROOM_KEY);
+export function getActiveRoomId(): string {
+  return localStorage.getItem(ACTIVE_ROOM_KEY) || DEFAULT_ROOM_ID;
 }
 
 export function setActiveRoomId(id: string) {
@@ -94,13 +137,13 @@ export function setActiveRoomId(id: string) {
 
 export function createNewRoom(
   title: string,
-  durationMinutes: number = 5,
+  durationMinutes: number = 10,
   questions: Question[],
   options?: Partial<ExamSessionConfig>,
   modules?: ExamModule[]
 ): RoomData {
-  const roomId = 'room_' + Date.now().toString(36) + Math.random().toString(36).substring(2, 6);
-  const code = generateRoomCode();
+  const roomId = DEFAULT_ROOM_ID;
+  const code = DEFAULT_ROOM_CODE;
 
   const config: ExamSessionConfig = {
     id: roomId,
@@ -135,28 +178,32 @@ export function createNewRoom(
 export function initializeDefaultRoom(): RoomData {
   const rooms = getAllRooms();
   const existingActive = getActiveRoomId();
+
   if (existingActive && rooms[existingActive]) {
     const existing = rooms[existingActive];
     if (!existing.modules || existing.modules.length === 0) {
       existing.modules = [...DEFAULT_MODULES];
-      saveRoom(existing);
     }
+    // Always sync existing room to the server to ensure teacher and students match
+    saveRoom(existing);
     return existing;
   }
+
   const firstPreset = DEFAULT_EXAM_PRESETS[0];
   const room = createNewRoom(
     firstPreset.title,
-    firstPreset.durationMinutes,
+    10,
     firstPreset.questions,
     { description: firstPreset.description },
     firstPreset.modules || DEFAULT_MODULES
   );
+
+  saveRoom(room);
   return room;
 }
 
 export function addSubmissionToRoom(roomId: string, submission: StudentSubmission): RoomData | null {
-  const room = getRoomById(roomId);
-  if (!room) return null;
+  const room = getRoomById(roomId) || initializeDefaultRoom();
 
   // Filter out any prior submission from this student name or ID
   const existingIdx = room.submissions.findIndex(
@@ -184,14 +231,19 @@ export function addSubmissionToRoom(roomId: string, submission: StudentSubmissio
   saveRoom(room);
   broadcastEvent('new_submission', { roomId, submission });
 
-  // Post to backend server
+  // Post to backend server immediately
   fetch(`/api/rooms/${roomId}/submit`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(submission),
-  }).catch(() => {
-    // Ignore error
-  });
+  })
+    .then((res) => (res.ok ? res.json() : null))
+    .then((data) => {
+      if (data && data.room) {
+        saveRoom(data.room);
+      }
+    })
+    .catch(() => {});
 
   return room;
 }
@@ -201,8 +253,7 @@ export function addSubmissionToRoom(roomId: string, submission: StudentSubmissio
  * to immediately showcase the Top 1 to 5 leaderboard & podium!
  */
 export function simulateDemoTrainees(roomId: string): RoomData | null {
-  const room = getRoomById(roomId);
-  if (!room) return null;
+  const room = getRoomById(roomId) || initializeDefaultRoom();
 
   const mockStudents = [
     { name: 'សេង ពិសិដ្ឋ (Piseth)', scorePercent: 100, durationSec: 135 },
@@ -243,8 +294,7 @@ export function registerStudentToRoom(
   roomId: string,
   student: { name: string; studentId?: string; moduleId?: string }
 ): RoomData | null {
-  const room = getRoomById(roomId);
-  if (!room) return null;
+  const room = getRoomById(roomId) || initializeDefaultRoom();
 
   if (!room.registeredStudents) {
     room.registeredStudents = [];
@@ -273,12 +323,19 @@ export function registerStudentToRoom(
   saveRoom(room);
   broadcastEvent('student_registered', { roomId, student: regStudent });
 
-  // Post to backend
+  // Post to backend server immediately
   fetch(`/api/rooms/${roomId}/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(regStudent),
-  }).catch(() => {});
+  })
+    .then((res) => (res.ok ? res.json() : null))
+    .then((data) => {
+      if (data && data.room) {
+        saveRoom(data.room);
+      }
+    })
+    .catch(() => {});
 
   return room;
 }
@@ -287,8 +344,7 @@ export function registerStudentToRoom(
  * Simulate 5-6 sample registered students for teacher demo
  */
 export function simulateDemoRegistrations(roomId: string): RoomData | null {
-  const room = getRoomById(roomId);
-  if (!room) return null;
+  const room = getRoomById(roomId) || initializeDefaultRoom();
 
   const mockNames = [
     'សេង ពិសិដ្ឋ',
@@ -332,4 +388,3 @@ export function clearRegisteredStudents(roomId: string): RoomData | null {
   broadcastEvent('rooms_updated');
   return room;
 }
-

@@ -1,0 +1,6 @@
+{
+  "name": "KhmerQuiz Pro - ប្រព័ន្ធប្រឡងតេស្តសមត្ថភាព QR & Top 5",
+  "description": "កម្មវិធីប្រឡងនិងតេស្តសមត្ថភាពសិក្ខាកាមតាម QR Code ជាមួយប្រព័ន្ធកំណត់ម៉ោង សាប់សំណួរចម្លើយស្វ័យប្រវត្តិ និងតារាងកិត្តិយស Top 1-5 ភ្លាមៗ",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
